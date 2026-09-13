@@ -1,0 +1,16 @@
+[package]
+name = "udisk_tester"
+version = "0.2.0"
+edition = "2021"
+description = "开源U盘校验测速工具（Rust版，仿H2testw）"
+
+[dependencies]
+eframe = "0.22"
+rand = "0.8"
+walkdir = "2"
+chrono = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
