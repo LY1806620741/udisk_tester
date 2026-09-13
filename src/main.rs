@@ -90,7 +90,7 @@ impl AppState {
         let mut cnt = 0;
         if let Ok(entries) = fs::read_dir(drive) {
             for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy();
+                let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with(TEST_FILE_PREFIX) && name.ends_with(TEST_FILE_EXT) {
                     if fs::remove_file(entry.path()).is_ok() {
                         cnt += 1;
@@ -160,6 +160,7 @@ impl AppState {
             let mut total_write: u64 = 0;
             // (文件路径, 写入内容的哈希)，校验阶段据此比对
             let mut written_files: Vec<(PathBuf, u64)> = Vec::new();
+            let stop_check = || *stop_flag.lock().unwrap();
 
             // 写入阶段（流式生成随机数据，不占用大量内存）
             loop {
@@ -177,23 +178,15 @@ impl AppState {
                 }
                 let fname = root.join(format!("{}{}{}", TEST_FILE_PREFIX, file_idx, TEST_FILE_EXT));
                 send_log(format!("写入 {:?}", fname.file_name().unwrap()));
-                let mut f = File::create(&fname).unwrap();
-                let mut buf = vec![0u8; 128 * 1024];
-                let mut rng = rand::thread_rng();
-                let mut hasher = DefaultHasher::new();
-                let mut wrote: u64 = 0;
-                while wrote < file_size {
-                    if *stop_flag.lock().unwrap() {
+                let (hash, wrote) = match write_random_file(&fname, file_size, &stop_check) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        send_log(format!("写入失败 {:?}: {}", fname.file_name().unwrap(), e));
                         break;
                     }
-                    let to_write = std::cmp::min(buf.len() as u64, file_size - wrote);
-                    rng.fill_bytes(&mut buf[0..to_write as usize]);
-                    f.write_all(&buf[0..to_write as usize]).unwrap();
-                    hasher.write(&buf[0..to_write as usize]);
-                    wrote += to_write;
-                }
+                };
                 total_write += wrote;
-                written_files.push((fname, hasher.finish()));
+                written_files.push((fname, hash));
                 file_idx += 1;
                 send_progress(
                     &format!("写入阶段 {:.2} GB / 预计 {:.2} GB", gb(total_write), gb(est_total)),
@@ -212,23 +205,21 @@ impl AppState {
                     break;
                 }
                 send_log(format!("校验 {:?}", fp.file_name().unwrap()));
-                let mut f = File::open(&fp).unwrap();
-                let mut buf = vec![0u8; 128 * 1024];
-                let mut hasher = DefaultHasher::new();
-                loop {
-                    let n = f.read(&mut buf).unwrap();
-                    if n == 0 {
-                        break;
+                let (hash, bytes) = match hash_file(fp) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        send_log(format!("读取失败 {:?}: {}", fp.file_name().unwrap(), e));
+                        err_cnt += 1;
+                        continue;
                     }
-                    verified_bytes += n as u64;
-                    hasher.write(&buf[0..n]);
-                }
+                };
+                verified_bytes += bytes;
                 send_progress(
                     &format!("校验阶段 {:.2} GB / {:.2} GB", gb(verified_bytes), gb(total_write)),
                     verified_bytes,
                     total_write,
                 );
-                let ok = hasher.finish() == *expected_hash;
+                let ok = hash == *expected_hash;
                 if ok {
                     send_log(format!("✅ {:?} 校验通过", fp.file_name().unwrap()));
                 } else {
@@ -515,6 +506,44 @@ impl eframe::App for AppState {
     }
 }
 
+/// 以 128KB 块流式写入随机数据并计算内容哈希，返回 (哈希, 实际写入字节数)。
+/// 写入过程中每写一块都会检查 should_stop，用于支持用户中途停止。
+fn write_random_file(path: &Path, size: u64, should_stop: impl Fn() -> bool) -> std::io::Result<(u64, u64)> {
+    let mut f = File::create(path)?;
+    let mut buf = vec![0u8; 128 * 1024];
+    let mut rng = rand::thread_rng();
+    let mut hasher = DefaultHasher::new();
+    let mut wrote: u64 = 0;
+    while wrote < size {
+        if should_stop() {
+            break;
+        }
+        let to_write = std::cmp::min(buf.len() as u64, size - wrote);
+        rng.fill_bytes(&mut buf[0..to_write as usize]);
+        f.write_all(&buf[0..to_write as usize])?;
+        hasher.write(&buf[0..to_write as usize]);
+        wrote += to_write;
+    }
+    Ok((hasher.finish(), wrote))
+}
+
+/// 读取整个文件并计算哈希，返回 (哈希, 读取的总字节数)。
+fn hash_file(path: &Path) -> std::io::Result<(u64, u64)> {
+    let mut f = File::open(path)?;
+    let mut buf = vec![0u8; 128 * 1024];
+    let mut hasher = DefaultHasher::new();
+    let mut total: u64 = 0;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        hasher.write(&buf[0..n]);
+    }
+    Ok((hasher.finish(), total))
+}
+
 /// 获取指定目录所在磁盘的剩余空间（字节）。Windows 下使用系统 API。
 #[cfg(windows)]
 fn free_space_bytes(path: &Path) -> Option<u64> {
@@ -552,6 +581,103 @@ extern "system" {
         lp_total_number_of_bytes: *mut u64,
         lp_total_number_of_free_bytes: *mut u64,
     ) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hash_file, write_random_file, ProgressInfo};
+    use std::fs;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 每个测试使用独立的临时目录，避免并行测试互相干扰
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("udisk_tester_test_{}", name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn progress_frac_normal() {
+        let p = ProgressInfo {
+            visible: true,
+            phase: "测试".to_string(),
+            cur: 50,
+            total: 200,
+        };
+        assert!((p.frac() - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn progress_frac_total_zero() {
+        let p = ProgressInfo::default();
+        assert_eq!(p.frac(), 0.0);
+    }
+
+    #[test]
+    fn progress_frac_clamped() {
+        let over = ProgressInfo {
+            visible: true,
+            phase: String::new(),
+            cur: 300,
+            total: 100,
+        };
+        assert_eq!(over.frac(), 1.0);
+        let under = ProgressInfo {
+            visible: true,
+            phase: String::new(),
+            cur: 0,
+            total: 100,
+        };
+        assert_eq!(under.frac(), 0.0);
+    }
+
+    #[test]
+    fn write_then_hash_round_trip() {
+        let dir = temp_dir("roundtrip");
+        let path = dir.join("t.bin");
+        let (hash, wrote) = write_random_file(&path, 256 * 1024, || false).unwrap();
+        assert_eq!(wrote, 256 * 1024, "应写满整个文件");
+        let (hash2, bytes) = hash_file(&path).unwrap();
+        assert_eq!(bytes, 256 * 1024, "回读字节数应与写入一致");
+        assert_eq!(hash, hash2, "写入哈希与回读哈希应一致");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn corruption_detected() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("t.bin");
+        let (hash, _) = write_random_file(&path, 256 * 1024, || false).unwrap();
+        // 翻转文件中间一个字节，模拟数据损坏（扩容盘/闪存坏块）
+        let mut f = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(128 * 1024)).unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact(&mut b).unwrap();
+        f.seek(SeekFrom::Start(128 * 1024)).unwrap();
+        f.write_all(&[b[0] ^ 0xFF]).unwrap();
+        drop(f);
+        let (hash2, _) = hash_file(&path).unwrap();
+        assert_ne!(hash, hash2, "内容被篡改后哈希必须不同");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_interrupts_write() {
+        let dir = temp_dir("stop");
+        let path = dir.join("t.bin");
+        let calls = AtomicUsize::new(0);
+        let should_stop = || calls.fetch_add(1, Ordering::Relaxed) >= 8;
+        let (hash, wrote) = write_random_file(&path, 10 * 1024 * 1024, &should_stop).unwrap();
+        assert!(wrote < 10 * 1024 * 1024, "停止后不应写满");
+        assert_eq!(wrote, 8 * 128 * 1024, "应在第 8 个块后被中断");
+        // 中断前写入的部分应能被完整、正确地校验
+        let (hash2, bytes) = hash_file(&path).unwrap();
+        assert_eq!(bytes, wrote);
+        assert_eq!(hash, hash2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 fn main() -> Result<(), eframe::Error> {
