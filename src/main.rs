@@ -136,8 +136,6 @@ impl AppState {
                     total,
                 }));
             };
-            let gb = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
-
             send_log("===== 全盘读写校验开始 =====".to_string());
             let file_size = file_size_mb * 1024 * 1024;
             let root = Path::new(&drive);
@@ -297,7 +295,7 @@ impl AppState {
                 }
             }
             let t1 = t0.elapsed().as_secs_f64();
-            let write_seq = size_seq as f64 / 1024.0 / 1024.0 / t1;
+            let write_seq = mb_per_sec(size_seq as u64, t1);
             send_progress("连续写入", size_seq as u64, size_seq as u64);
 
             // 连续读取
@@ -319,7 +317,7 @@ impl AppState {
                 }
             }
             let t1 = t0.elapsed().as_secs_f64();
-            let read_seq = size_seq as f64 / 1024.0 / 1024.0 / t1;
+            let read_seq = mb_per_sec(size_seq as u64, t1);
             send_progress("连续读取", size_seq as u64, size_seq as u64);
             send_log(format!("连续写入: {:.2} MB/s | 连续读取: {:.2} MB/s", write_seq, read_seq));
 
@@ -343,7 +341,7 @@ impl AppState {
                 }
             }
             let t1 = t0.elapsed().as_secs_f64();
-            let write_4k = (COUNT * BLOCK) as f64 / 1024.0 / 1024.0 / t1;
+            let write_4k = mb_per_sec((COUNT * BLOCK) as u64, t1);
             send_progress("4K随机写入", COUNT as u64, COUNT as u64);
 
             send_progress("4K随机读取", 0, COUNT as u64);
@@ -362,7 +360,7 @@ impl AppState {
                 }
             }
             let t1 = t0.elapsed().as_secs_f64();
-            let read_4k = (COUNT * BLOCK) as f64 / 1024.0 / 1024.0 / t1;
+            let read_4k = mb_per_sec((COUNT * BLOCK) as u64, t1);
             send_progress("4K随机读取", COUNT as u64, COUNT as u64);
             send_log(format!("4K随机写入: {:.3} MB/s | 4K随机读取: {:.3} MB/s", write_4k, read_4k));
 
@@ -506,6 +504,16 @@ impl eframe::App for AppState {
     }
 }
 
+/// 字节数转 GiB（1024^3）
+fn gb(b: u64) -> f64 {
+    b as f64 / 1024.0 / 1024.0 / 1024.0
+}
+
+/// 计算吞吐量 MB/s（bytes / 1024^2 / 秒）
+fn mb_per_sec(bytes: u64, secs: f64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0 / secs
+}
+
 /// 以 128KB 块流式写入随机数据并计算内容哈希，返回 (哈希, 实际写入字节数)。
 /// 写入过程中每写一块都会检查 should_stop，用于支持用户中途停止。
 fn write_random_file(path: &Path, size: u64, should_stop: impl Fn() -> bool) -> std::io::Result<(u64, u64)> {
@@ -585,7 +593,7 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_file, write_random_file, ProgressInfo};
+    use super::{gb, hash_file, mb_per_sec, write_random_file, ProgressInfo};
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -677,6 +685,85 @@ mod tests {
         assert_eq!(bytes, wrote);
         assert_eq!(hash, hash2);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn empty_file_hashes_stable() {
+        let dir = temp_dir("empty");
+        let path = dir.join("e.bin");
+        let (h1, w) = write_random_file(&path, 0, || false).unwrap();
+        assert_eq!(w, 0, "空文件不应写入任何字节");
+        let (h2, b) = hash_file(&path).unwrap();
+        assert_eq!(b, 0);
+        assert_eq!(h1, h2, "空文件的写入哈希与回读哈希应一致");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 模拟全盘校验的"多文件写入 → 逐文件回读比对"流程
+    #[test]
+    fn multi_file_round_trip_all_pass() {
+        let dir = temp_dir("multi");
+        let mut files = Vec::new();
+        for i in 0..3u64 {
+            let path = dir.join(format!("f{}.bin", i));
+            let (h, _) = write_random_file(&path, (i + 1) * 64 * 1024, || false).unwrap();
+            files.push((path, h));
+        }
+        let mut errs = 0usize;
+        for (p, expected) in &files {
+            let (h, _) = hash_file(p).unwrap();
+            if h != *expected {
+                errs += 1;
+            }
+        }
+        assert_eq!(errs, 0, "所有文件都应校验通过");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 只损坏其中一个文件时，应只报出该文件损坏
+    #[test]
+    fn multi_file_corruption_isolated() {
+        let dir = temp_dir("multi_corrupt");
+        let mut files = Vec::new();
+        for i in 0..3u64 {
+            let path = dir.join(format!("f{}.bin", i));
+            let (h, _) = write_random_file(&path, 64 * 1024, || false).unwrap();
+            files.push((path, h));
+        }
+        // 只损坏第二个文件的首字节
+        let mut f = fs::OpenOptions::new().read(true).write(true).open(&files[1].0).unwrap();
+        let mut b = [0u8; 1];
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_exact(&mut b).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[b[0] ^ 0xFF]).unwrap();
+        drop(f);
+
+        let mut errs: Vec<usize> = Vec::new();
+        for (i, (p, expected)) in files.iter().enumerate() {
+            let (h, _) = hash_file(p).unwrap();
+            if h != *expected {
+                errs.push(i);
+            }
+        }
+        assert_eq!(errs, vec![1], "只有被损坏的第 2 个文件应报错");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mb_per_sec_math() {
+        assert_eq!(mb_per_sec(0, 1.0), 0.0);
+        let r = mb_per_sec(100 * 1024 * 1024, 1.0);
+        assert!((r - 100.0).abs() < 1e-6, "100MB/秒 应等于 100 MB/s");
+        let r2 = mb_per_sec(100 * 1024 * 1024, 0.5);
+        assert!((r2 - 200.0).abs() < 1e-6, "耗时减半吞吐应翻倍");
+    }
+
+    #[test]
+    fn gb_math() {
+        assert_eq!(gb(0), 0.0);
+        assert!((gb(1024 * 1024 * 1024) - 1.0).abs() < 1e-9);
+        assert!((gb(512 * 1024 * 1024) - 0.5).abs() < 1e-9);
     }
 }
 

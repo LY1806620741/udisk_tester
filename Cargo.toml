@@ -9,6 +9,9 @@ eframe = "0.22"
 rand = "0.8"
 walkdir = "2"
 chrono = "0.4"
+# eframe 0.22 在 Windows 上依赖 winapi 的 winuser/windef 模块但未声明对应 feature，
+# 这里显式开启以修复 Windows 下编译失败（feature 会在依赖图中合并）
+winapi = { version = "0.3", features = ["windef", "winuser"] }
 
 [profile.release]
 lto = true
