@@ -23,6 +23,7 @@
 | macOS（Apple Silicon） | `udisk_tester-macos-arm64.tar.gz`（解压后运行 `./udisk_tester`） |
 
 > Linux / macOS 包为动态链接构建，运行时需系统自带 X11 / Wayland 与 OpenGL 库（桌面发行版通常已具备）。
+> Linux 若界面中文显示为方块，请安装中文字体：`sudo apt install fonts-noto-cjk`。
 
 ## 使用教程
 

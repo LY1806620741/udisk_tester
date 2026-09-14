@@ -53,6 +53,7 @@ struct AppState {
     log_queue: VecDeque<String>,
     stop_flag: Arc<Mutex<bool>>,
     progress: ProgressInfo,
+    fonts_ready: bool,
 }
 
 impl AppState {
@@ -61,6 +62,33 @@ impl AppState {
         s.file_size_mb = 1024;
         s.refresh_drives();
         s
+    }
+
+    /// 加载系统中文字体作为 UI 字体的 fallback，避免中文显示为方块
+    fn setup_cjk_fonts(&mut self, ctx: &egui::Context) {
+        match find_cjk_font() {
+            Some(path) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let mut fonts = egui::FontDefinitions::default();
+                    fonts
+                        .font_data
+                        .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
+                    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                        fonts
+                            .families
+                            .entry(family)
+                            .or_default()
+                            .push("cjk".to_owned());
+                    }
+                    ctx.set_fonts(fonts);
+                    self.log(format!("已加载中文字体：{}", path.display()));
+                }
+                Err(e) => self.log(format!("中文字体读取失败 {}：{}", path.display(), e)),
+            },
+            None => self.log(
+                "未找到中文字体，中文可能显示为方块；建议安装 fonts-noto-cjk（Linux）".to_string(),
+            ),
+        }
     }
 
     fn refresh_drives(&mut self) {
@@ -437,6 +465,10 @@ impl AppState {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.fonts_ready {
+            self.setup_cjk_fonts(ctx);
+            self.fonts_ready = true;
+        }
         self.poll_messages();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("开源U盘校验测速工具（Rust版，仿H2testw）");
@@ -526,6 +558,59 @@ fn gb(b: u64) -> f64 {
 /// 计算吞吐量 MB/s（bytes / 1024^2 / 秒）
 fn mb_per_sec(bytes: u64, secs: f64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / secs
+}
+
+/// 常见系统中文字体候选路径（按优先级），用于跨平台提供 CJK 字形。
+/// Linux 优先 SC 简体专版，其次 Noto CJK TTC / 文泉驿 / AR PL。
+const CJK_FONT_CANDIDATES: &[&str] = &[
+    // Windows
+    "C:\\Windows\\Fonts\\msyh.ttc", // 微软雅黑
+    "C:\\Windows\\Fonts\\msyh.ttf",
+    "C:\\Windows\\Fonts\\simhei.ttf", // 黑体
+    "C:\\Windows\\Fonts\\simsun.ttc", // 宋体
+    // macOS
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+    // Linux：Noto CJK SC 简体专版优先
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/google-noto-sans-cjk-ttc/NotoSansCJK-Regular.ttc",
+    // Linux：文泉驿 / Droid / AR PL
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+];
+
+/// 用户目录下常见的中文字体文件名（~/.fonts 与 ~/.local/share/fonts）
+const USER_CJK_FONT_FILES: &[&str] = &[
+    "NotoSansCJKsc-Regular.otf",
+    "NotoSansCJK-Regular.ttc",
+    "wqy-microhei.ttc",
+    "wqy-zenhei.ttc",
+    "SourceHanSansSC-Regular.otf",
+    "msyh.ttc",
+];
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+/// 找到第一个可读取的中文字体文件（跨平台候选 + 用户目录）
+fn find_cjk_font() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = CJK_FONT_CANDIDATES.iter().map(PathBuf::from).collect();
+    if let Some(home) = home_dir() {
+        for f in USER_CJK_FONT_FILES {
+            candidates.push(home.join(".fonts").join(f));
+            candidates.push(home.join(".local").join("share").join("fonts").join(f));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// 判断文件名是否为测试文件（前缀 + 后缀匹配）
@@ -622,13 +707,14 @@ extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{
-        gb, has_enough_space, hash_file, is_test_file, mb_per_sec, write_random_file, AppState,
-        ProgressInfo, TaskMsg, SPACE_MARGIN,
+        find_cjk_font, gb, has_enough_space, hash_file, is_test_file, mb_per_sec, write_random_file,
+        AppState, ProgressInfo, TaskMsg, SPACE_MARGIN,
     };
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use ab_glyph::Font as _;
 
     /// 每个测试使用独立的临时目录，避免并行测试互相干扰
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -881,6 +967,31 @@ mod tests {
         let r = hash_file(&path, &should_stop).unwrap();
         assert!(r.is_none(), "校验过程中被停止应返回 Ok(None)");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_cjk_font_finds_system_font() {
+        let p = find_cjk_font();
+        assert!(
+            p.is_some(),
+            "系统应能发现一个中文字体（本机需安装 Noto CJK / 文泉驿等）"
+        );
+    }
+
+    #[test]
+    fn cjk_font_contains_chinese_glyphs() {
+        let bytes = find_cjk_font()
+            .and_then(|p| std::fs::read(p).ok())
+            .expect("应能读取到中文字体文件");
+        let font = ab_glyph::FontArc::try_from_vec(bytes).expect("字体文件应可被解析");
+        for ch in ['中', '文', '校', '验', '盘', '符', '测', '速', 'U', '盘'] {
+            assert_ne!(
+                font.glyph_id(ch),
+                ab_glyph::GlyphId(0),
+                "字体应包含字形 {}",
+                ch
+            );
+        }
     }
 }
 

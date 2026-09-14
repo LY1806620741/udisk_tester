@@ -1,6 +1,6 @@
 [package]
 name = "udisk_tester"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "开源U盘校验测速工具（Rust版，仿H2testw）"
 
@@ -12,6 +12,10 @@ chrono = "0.4"
 # eframe 0.22 在 Windows 上依赖 winapi 的 winuser/windef 模块但未声明对应 feature，
 # 这里显式开启以修复 Windows 下编译失败（feature 会在依赖图中合并）
 winapi = { version = "0.3", features = ["windef", "winuser"] }
+
+[dev-dependencies]
+# 测试中验证系统中文字体可解析且包含 CJK 字形（与 egui 0.22 同版本族）
+ab_glyph = "0.2"
 
 [profile.release]
 lto = true
