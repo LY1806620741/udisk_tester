@@ -91,7 +91,7 @@ impl AppState {
         if let Ok(entries) = fs::read_dir(drive) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(TEST_FILE_PREFIX) && name.ends_with(TEST_FILE_EXT) {
+                if is_test_file(&name) {
                     if fs::remove_file(entry.path()).is_ok() {
                         cnt += 1;
                     }
@@ -167,7 +167,7 @@ impl AppState {
                     break;
                 }
                 let space = free_space_bytes(root).unwrap_or(0);
-                if space < file_size + SPACE_MARGIN {
+                if !has_enough_space(space, file_size) {
                     send_log(format!(
                         "剩余空间不足，停止写入。剩余 {:.2} GB",
                         gb(space)
@@ -175,6 +175,9 @@ impl AppState {
                     break;
                 }
                 let fname = root.join(format!("{}{}{}", TEST_FILE_PREFIX, file_idx, TEST_FILE_EXT));
+                if fname.exists() {
+                    send_log(format!("⚠ {:?} 已存在，将被覆盖", fname.file_name().unwrap()));
+                }
                 send_log(format!("写入 {:?}", fname.file_name().unwrap()));
                 let (hash, wrote) = match write_random_file(&fname, file_size, &stop_check) {
                     Ok(v) => v,
@@ -203,8 +206,12 @@ impl AppState {
                     break;
                 }
                 send_log(format!("校验 {:?}", fp.file_name().unwrap()));
-                let (hash, bytes) = match hash_file(fp) {
-                    Ok(v) => v,
+                let (hash, bytes) = match hash_file(fp, &stop_check) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        send_log(format!("用户终止校验 {:?}", fp.file_name().unwrap()));
+                        break;
+                    }
                     Err(e) => {
                         send_log(format!("读取失败 {:?}: {}", fp.file_name().unwrap(), e));
                         err_cnt += 1;
@@ -271,6 +278,9 @@ impl AppState {
 
             send_log("==== 简易测速开始 ====".to_string());
             let tmp_path = Path::new(&drive).join("bench_test.tmp");
+            if tmp_path.exists() {
+                send_log("⚠ bench_test.tmp 已存在，将被覆盖".to_string());
+            }
             let size_seq = 100 * 1024 * 1024;
             let mut buf = vec![0u8; 128 * 1024];
             let mut rng = rand::thread_rng();
@@ -467,6 +477,10 @@ impl eframe::App for AppState {
                             self.clean_test_files();
                         }
                     });
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 130, 20),
+                        "⚠ 全盘校验会持续写入所选盘符直至仅剩约 100MB 空间；请确认盘符无误、重要数据已备份。",
+                    );
                 }
                 1 => {
                     ui.horizontal(|ui| {
@@ -514,6 +528,16 @@ fn mb_per_sec(bytes: u64, secs: f64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / secs
 }
 
+/// 判断文件名是否为测试文件（前缀 + 后缀匹配）
+fn is_test_file(name: &str) -> bool {
+    name.starts_with(TEST_FILE_PREFIX) && name.ends_with(TEST_FILE_EXT)
+}
+
+/// 剩余空间是否足够再写一个文件（写入后仍需保留 SPACE_MARGIN 余量）
+fn has_enough_space(space: u64, file_size: u64) -> bool {
+    space >= file_size + SPACE_MARGIN
+}
+
 /// 以 128KB 块流式写入随机数据并计算内容哈希，返回 (哈希, 实际写入字节数)。
 /// 写入过程中每写一块都会检查 should_stop，用于支持用户中途停止。
 fn write_random_file(path: &Path, size: u64, should_stop: impl Fn() -> bool) -> std::io::Result<(u64, u64)> {
@@ -536,12 +560,16 @@ fn write_random_file(path: &Path, size: u64, should_stop: impl Fn() -> bool) -> 
 }
 
 /// 读取整个文件并计算哈希，返回 (哈希, 读取的总字节数)。
-fn hash_file(path: &Path) -> std::io::Result<(u64, u64)> {
+/// 每读一块都会检查 should_stop；被停止时返回 Ok(None)。
+fn hash_file(path: &Path, should_stop: impl Fn() -> bool) -> std::io::Result<Option<(u64, u64)>> {
     let mut f = File::open(path)?;
     let mut buf = vec![0u8; 128 * 1024];
     let mut hasher = DefaultHasher::new();
     let mut total: u64 = 0;
     loop {
+        if should_stop() {
+            return Ok(None);
+        }
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
@@ -549,7 +577,7 @@ fn hash_file(path: &Path) -> std::io::Result<(u64, u64)> {
         total += n as u64;
         hasher.write(&buf[0..n]);
     }
-    Ok((hasher.finish(), total))
+    Ok(Some((hasher.finish(), total)))
 }
 
 /// 获取指定目录所在磁盘的剩余空间（字节）。Windows 下使用系统 API。
@@ -593,10 +621,14 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{gb, hash_file, mb_per_sec, write_random_file, ProgressInfo};
+    use super::{
+        gb, has_enough_space, hash_file, is_test_file, mb_per_sec, write_random_file, AppState,
+        ProgressInfo, TaskMsg, SPACE_MARGIN,
+    };
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     /// 每个测试使用独立的临时目录，避免并行测试互相干扰
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -647,7 +679,7 @@ mod tests {
         let path = dir.join("t.bin");
         let (hash, wrote) = write_random_file(&path, 256 * 1024, || false).unwrap();
         assert_eq!(wrote, 256 * 1024, "应写满整个文件");
-        let (hash2, bytes) = hash_file(&path).unwrap();
+        let (hash2, bytes) = hash_file(&path, || false).unwrap().unwrap();
         assert_eq!(bytes, 256 * 1024, "回读字节数应与写入一致");
         assert_eq!(hash, hash2, "写入哈希与回读哈希应一致");
         fs::remove_dir_all(&dir).unwrap();
@@ -666,7 +698,7 @@ mod tests {
         f.seek(SeekFrom::Start(128 * 1024)).unwrap();
         f.write_all(&[b[0] ^ 0xFF]).unwrap();
         drop(f);
-        let (hash2, _) = hash_file(&path).unwrap();
+        let (hash2, _) = hash_file(&path, || false).unwrap().unwrap();
         assert_ne!(hash, hash2, "内容被篡改后哈希必须不同");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -681,7 +713,7 @@ mod tests {
         assert!(wrote < 10 * 1024 * 1024, "停止后不应写满");
         assert_eq!(wrote, 8 * 128 * 1024, "应在第 8 个块后被中断");
         // 中断前写入的部分应能被完整、正确地校验
-        let (hash2, bytes) = hash_file(&path).unwrap();
+        let (hash2, bytes) = hash_file(&path, || false).unwrap().unwrap();
         assert_eq!(bytes, wrote);
         assert_eq!(hash, hash2);
         fs::remove_dir_all(&dir).unwrap();
@@ -693,7 +725,7 @@ mod tests {
         let path = dir.join("e.bin");
         let (h1, w) = write_random_file(&path, 0, || false).unwrap();
         assert_eq!(w, 0, "空文件不应写入任何字节");
-        let (h2, b) = hash_file(&path).unwrap();
+        let (h2, b) = hash_file(&path, || false).unwrap().unwrap();
         assert_eq!(b, 0);
         assert_eq!(h1, h2, "空文件的写入哈希与回读哈希应一致");
         fs::remove_dir_all(&dir).unwrap();
@@ -711,7 +743,7 @@ mod tests {
         }
         let mut errs = 0usize;
         for (p, expected) in &files {
-            let (h, _) = hash_file(p).unwrap();
+            let (h, _) = hash_file(p, || false).unwrap().unwrap();
             if h != *expected {
                 errs += 1;
             }
@@ -741,7 +773,7 @@ mod tests {
 
         let mut errs: Vec<usize> = Vec::new();
         for (i, (p, expected)) in files.iter().enumerate() {
-            let (h, _) = hash_file(p).unwrap();
+            let (h, _) = hash_file(p, || false).unwrap().unwrap();
             if h != *expected {
                 errs.push(i);
             }
@@ -764,6 +796,91 @@ mod tests {
         assert_eq!(gb(0), 0.0);
         assert!((gb(1024 * 1024 * 1024) - 1.0).abs() < 1e-9);
         assert!((gb(512 * 1024 * 1024) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn is_test_file_matches() {
+        assert!(is_test_file("test_1.h2w"));
+        assert!(is_test_file("test_123.h2w"));
+        assert!(!is_test_file("test_1.txt"), "后缀不匹配不算测试文件");
+        assert!(!is_test_file("other.h2w"), "前缀不匹配不算测试文件");
+        assert!(!is_test_file("bench_test.tmp"), "测速临时文件不属于校验测试文件");
+        assert!(!is_test_file(""), "空名字不算");
+    }
+
+    #[test]
+    fn has_enough_space_edges() {
+        // 恰好满足：space == file_size + margin
+        assert!(has_enough_space(SPACE_MARGIN + 1024, 1024));
+        // 差一个字节都不行
+        assert!(!has_enough_space(SPACE_MARGIN + 1023, 1024));
+        // 空间完全不足
+        assert!(!has_enough_space(0, 1024));
+        // 大文件边界
+        assert!(has_enough_space(SPACE_MARGIN + 4096 * 1024 * 1024, 4096 * 1024 * 1024));
+        assert!(!has_enough_space(SPACE_MARGIN + 4096 * 1024 * 1024 - 1, 4096 * 1024 * 1024));
+    }
+
+    #[test]
+    fn log_queue_capped() {
+        let mut app = AppState::default();
+        for i in 0..300 {
+            app.log(format!("msg {}", i));
+        }
+        assert_eq!(app.log_queue.len(), 200, "日志队列应被限制在 200 条");
+        // 队首是最早的（第 100 条），队尾是最新的
+        assert!(app.log_queue.front().unwrap().contains("msg 100"));
+        assert!(app.log_queue.back().unwrap().contains("msg 299"));
+    }
+
+    #[test]
+    fn poll_messages_flow() {
+        let mut app = AppState::default();
+        let (tx, rx) = mpsc::channel();
+        app.task_rx = Some(rx);
+        app.running = true;
+
+        tx.send(TaskMsg::Log("hello".to_string())).unwrap();
+        tx.send(TaskMsg::Progress(ProgressInfo {
+            visible: true,
+            phase: "写入阶段".to_string(),
+            cur: 1,
+            total: 2,
+        }))
+        .unwrap();
+        app.poll_messages();
+        assert_eq!(app.log_queue.len(), 1);
+        assert!(app.log_queue.back().unwrap().contains("hello"));
+        assert!(app.progress.visible);
+        assert!(app.running, "未收到 Finished 前仍处于运行中");
+
+        tx.send(TaskMsg::Finished).unwrap();
+        app.poll_messages();
+        assert!(!app.running, "收到 Finished 后应停止运行");
+        assert!(app.task_rx.is_none(), "Finished 后应清空消息接收端");
+        assert!(app.task_tx.is_none());
+        assert!(!app.progress.visible, "Finished 后进度条应隐藏");
+    }
+
+    #[test]
+    fn write_random_file_errors_on_dir() {
+        let dir = temp_dir("wr_err");
+        // 目标路径是目录，File::create 必然失败
+        let r = write_random_file(&dir, 100, || false);
+        assert!(r.is_err(), "向目录路径写入应返回错误而不是 panic");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hash_file_stops() {
+        let dir = temp_dir("hash_stop");
+        let path = dir.join("t.bin");
+        write_random_file(&path, 10 * 1024 * 1024, || false).unwrap();
+        let calls = AtomicUsize::new(0);
+        let should_stop = || calls.fetch_add(1, Ordering::Relaxed) >= 4;
+        let r = hash_file(&path, &should_stop).unwrap();
+        assert!(r.is_none(), "校验过程中被停止应返回 Ok(None)");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
 
