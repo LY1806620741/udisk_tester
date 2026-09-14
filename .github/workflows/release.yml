@@ -10,8 +10,19 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: udisk_tester-windows-x64.zip
+          - os: ubuntu-latest
+            artifact: udisk_tester-linux-x64.tar.gz
+          - os: macos-latest
+            artifact: udisk_tester-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -22,23 +33,35 @@ jobs:
       - name: 启用 Rust 缓存
         uses: Swatinem/rust-cache@v2
 
+      - name: 安装 Linux 系统依赖（egui/eframe 编译需要）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libgl1-mesa-dev
+
       - name: 编译 Release
         run: cargo build --release
 
-      - name: 打包 zip
+      - name: 打包 zip（Windows）
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path target\release\udisk_tester.exe -DestinationPath udisk_tester-windows-x64.zip
+          Compress-Archive -Path target\release\udisk_tester.exe -DestinationPath ${{ matrix.artifact }}
+
+      - name: 打包 tar.gz（Linux / macOS）
+        if: runner.os != 'Windows'
+        run: |
+          tar -C target/release -czf ${{ matrix.artifact }} udisk_tester
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: udisk_tester-windows-x64
-          path: udisk_tester-windows-x64.zip
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
 
       - name: 发布到 GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: udisk_tester-windows-x64.zip
+          files: ${{ matrix.artifact }}
           generate_release_notes: true

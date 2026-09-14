@@ -12,12 +12,17 @@
 - **USB 信息查询**：读取 U 盘设备的 VID / PID
 - 图形界面（egui），带实时进度条与运行日志
 
-## 下载使用（Windows）
+## 下载使用
 
-无需安装 Rust 或任何运行时。从 [Releases](https://github.com/LY1806620741/udisk_tester/releases) 下载
-`udisk_tester-windows-x64.zip`，解压后双击 `udisk_tester.exe` 即可使用。
+无需安装 Rust 或任何运行时。从 [Releases](https://github.com/LY1806620741/udisk_tester/releases) 按系统下载对应包：
 
-> 建议在 Windows 10 / 11（x64）上使用。
+| 系统 | 包 |
+|---|---|
+| Windows 10/11（x64） | `udisk_tester-windows-x64.zip`（解压后双击 `udisk_tester.exe`） |
+| Linux（x64） | `udisk_tester-linux-x64.tar.gz`（解压后运行 `./udisk_tester`） |
+| macOS（Apple Silicon） | `udisk_tester-macos-arm64.tar.gz`（解压后运行 `./udisk_tester`） |
+
+> Linux / macOS 包为动态链接构建，运行时需系统自带 X11 / Wayland 与 OpenGL 库（桌面发行版通常已具备）。
 
 ## 使用教程
 
@@ -82,7 +87,7 @@ cargo test
 ## CI 与发布
 
 - GitHub Actions 在 Windows / macOS / Ubuntu 三平台自动执行 `cargo test` 与 `cargo build --release`
-- 推送 tag（如 `v0.2.0`）自动构建并发布 Windows 版 zip 到 Releases
+- 推送 tag（如 `v0.3.0`）自动在三个平台构建并发布对应包到 Releases：Windows zip、Linux tar.gz、macOS tar.gz
 
 ## 安全提示
 
