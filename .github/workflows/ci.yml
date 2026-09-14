@@ -23,11 +23,11 @@ jobs:
       - name: 启用 Rust 缓存
         uses: Swatinem/rust-cache@v2
 
-      - name: 安装 Linux 系统依赖（egui/eframe 编译需要）
+      - name: 安装 Linux 系统依赖（egui/eframe 编译 + 中文字体测试需要）
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libgl1-mesa-dev
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libgl1-mesa-dev fonts-noto-cjk
 
       - name: 测试
         run: cargo test
